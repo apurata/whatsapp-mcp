@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -641,7 +642,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -677,49 +678,13 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
+	// Apurata: send disabled (read-only). Keep the route so callers get a clear 403.
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
+		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success: false,
+			Message: "Send disabled (Apurata read-only WhatsApp MCP)",
 		})
 	})
 
@@ -774,8 +739,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server (localhost only — Apurata)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +765,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -818,6 +783,13 @@ func main() {
 			return
 		}
 	}
+
+	// Name the companion so WhatsApp does not show "Dispositivo sin nombre".
+	// PlatformType must not stay UNKNOWN (whatsmeow default).
+	// Os "Comet" = Perplexity browser (Chromium); PlatformType CHROME so Meta sees a normal web companion.
+	store.SetOSInfo("Comet", [3]uint32{1, 0, 0})
+	chrome := waProto.DeviceProps_CHROME
+	store.DeviceProps.PlatformType = &chrome
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
@@ -859,21 +831,50 @@ func main() {
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, errQR := client.GetQRChannel(context.Background())
+		if errQR != nil {
+			logger.Errorf("Failed to get QR channel: %v", errQR)
+			return
+		}
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
 
-		// Print QR code for pairing with phone
+		pairPhone := strings.TrimSpace(os.Getenv("WA_PAIR_PHONE"))
+		pairCodePrinted := false
+
+		// Print QR code for pairing with phone (also supports pairing code via WA_PAIR_PHONE)
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				if pairPhone != "" && !pairCodePrinted {
+					// PairPhone display name must look like "Browser (OS)" or WhatsApp returns 400.
+					code, pairErr := client.PairPhone(
+						context.Background(),
+						pairPhone,
+						true,
+						whatsmeow.PairClientChrome,
+						"Chrome (Linux)",
+					)
+					if pairErr != nil {
+						logger.Errorf("PairPhone failed: %v", pairErr)
+					} else {
+						pairCodePrinted = true
+						fmt.Printf("\nOr link with code (WhatsApp → Linked devices → Link with phone number):\n  %s-%s\n", code[:4], code[4:])
+						fmt.Printf("Phone used: %s\n", pairPhone)
+					}
+				}
 			} else if evt.Event == "success" {
 				connected <- true
 				break
+			} else {
+				logger.Infof("QR channel event: %s", evt.Event)
+				if evt.Error != nil {
+					logger.Errorf("QR channel error: %v", evt.Error)
+				}
 			}
 		}
 
@@ -973,7 +974,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +989,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

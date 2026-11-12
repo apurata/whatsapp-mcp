@@ -43,11 +43,12 @@ upstream ──► main (sync only)
 
 Rollback: `git checkout apurata && git reset --hard apurata-pre-sync-YYYY-MM-DD` (or the last `apurata-synced-*`), then restart Cursor MCP.
 
-## Planned Apurata delta (not yet on this tip)
+## Apurata delta on this tip
 
-- **Read-only by default:** disable MCP `send_message` / `send_file` / `send_audio_message` and bridge `/api/send` (or gate behind an explicit env flag).
-- **Optional drafts:** local files only (never WhatsApp send).
-- **Localhost bind** for the Go bridge REST API.
+- **Read-only:** MCP omits `send_*` tools; bridge `/api/send` returns 403.
+- **Localhost bind** for the Go bridge REST API (`127.0.0.1`).
+- **Current whatsmeow** + companion name **Comet** (`PlatformType` CHROME) so pairing works.
+- **Optional drafts** (local files only): still open if we want them later.
 
 ## Cursor / ops pointer
 
